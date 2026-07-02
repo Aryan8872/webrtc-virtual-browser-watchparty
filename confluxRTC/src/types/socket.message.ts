@@ -1,0 +1,7 @@
+export const JOIN_ROOM = "join-room";
+export const SDP_OFFER = "sdp-offer";
+export const SDP_ANSWER = "sdp-answer";
+export const ICE_CANDIDATE = "ice-candidate";
+export const USER_JOINED = "user-joined";
+export const USER_LEFT="user-left"
+export const PAGE_FRAME="page-frame";

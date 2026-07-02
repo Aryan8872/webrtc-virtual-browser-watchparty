@@ -1,0 +1,15 @@
+# Dependency directories
+node_modules/
+
+# IDE / Editor folders
+.vscode/
+.idea/
+
+# Local env files
+.env
+.env.local
+__Complete Documentation_ Virtual Browser Watch Pa.md
+# Build output
+dist/
+build/
+*.log
