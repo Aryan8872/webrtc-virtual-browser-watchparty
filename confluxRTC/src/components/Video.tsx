@@ -206,6 +206,16 @@ const Video = () => {
     // Emit coordinates to the backend
     socket.emit(CANVAS_CLICK, { roomId, x: targetX, y: targetY });
   };
+  const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+    // Prevent default browser behaviors (like space scrolling page down, backspace navigating back)
+    event.preventDefault();
+    
+    const key = event.key;
+    console.log(`[Frontend] Key pressed: ${key}`);
+    
+    // Emit the key value directly over the socket connection
+    socket.emit("canvas-keydown", { roomId, key });
+  };
   return (
     <div>
       <h1>real time video call with webrtc simulated</h1>
@@ -218,9 +228,11 @@ const Video = () => {
           <canvas
             ref={canvasRef}
             onClick={(e) => handleCanvasClick(e)}
+            onKeyDown={(e) => handleCanvasKeyDown(e)}
+            tabIndex={0} // Makes the canvas focusable for keyboard events
             width="800"
             height="600"
-            style={{ border: "2px solid #334155", background: "#0f172a" }}
+            style={{ border: "2px solid #334155", background: "#0f172a", outline: "none", cursor: "text" }}
           ></canvas>
         </div>
 

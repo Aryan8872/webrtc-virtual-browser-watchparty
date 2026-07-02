@@ -1,7 +1,6 @@
 import puppeteer from "puppeteer";
 import path from "path";
 import { io } from "socket.io-client";
-
 const roomId = "room-100";
 const SOCKET_URL = "http://host.docker.internal:3000";
 const socket = io(SOCKET_URL);
@@ -45,11 +44,23 @@ async function startBrowserStream() {
   });
   socket.on("canvas-click", async (data) => {
     const { x, y } = data;
+    console.log(`[Container] Received canvas-click event inside container. Payload:`, data);
+    console.log(`Injecting mouse click inside container at: x=${x}, y=${y}`);
     try {
       // Puppeteer mouse click helper
       await newPage.mouse.click(x, y);
     } catch (err) {
       console.error("Failed to inject mouse click:", err);
+    }
+  });
+  socket.on("canvas-keydown", async (data) => {
+    const { key } = data;
+    console.log(`[Container] Received keydown event inside container. Key: ${key}`);
+    try {
+      // Puppeteer keyboard press helper
+      await newPage.keyboard.press(key);
+    } catch (err) {
+      console.error(`Failed to inject keypress: ${key}`, err);
     }
   });
   socket.on("disconnect", async () => {
