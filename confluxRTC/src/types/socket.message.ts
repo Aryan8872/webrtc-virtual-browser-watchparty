@@ -5,3 +5,4 @@ export const ICE_CANDIDATE = "ice-candidate";
 export const USER_JOINED = "user-joined";
 export const USER_LEFT="user-left"
 export const PAGE_FRAME="page-frame";
+export const CANVAS_CLICK ="canvas-click";

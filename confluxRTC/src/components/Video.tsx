@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { socket } from "../lib/api/socket";
 import {
+  CANVAS_CLICK,
   ICE_CANDIDATE,
   JOIN_ROOM,
   PAGE_FRAME,
@@ -190,6 +191,21 @@ const Video = () => {
     // Trigger socket connection
     socket.connect();
   };
+  const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+
+    // Calculate click coordinates relative to the canvas element bounds
+    const relativeX = event.clientX - rect.left;
+    const relativeY = event.clientY - rect.top;
+
+    // Scale coordinates to match the virtual browser's 800x600 viewport
+    const targetX = (relativeX / rect.width) * 800;
+    const targetY = (relativeY / rect.height) * 600;
+
+    // Emit coordinates to the backend
+    socket.emit(CANVAS_CLICK, { roomId, x: targetX, y: targetY });
+  };
   return (
     <div>
       <h1>real time video call with webrtc simulated</h1>
@@ -201,12 +217,13 @@ const Video = () => {
           <h3>Virtual Browser Stream</h3>
           <canvas
             ref={canvasRef}
+            onClick={(e) => handleCanvasClick(e)}
             width="800"
             height="600"
             style={{ border: "2px solid #334155", background: "#0f172a" }}
           ></canvas>
         </div>
-        
+
         <video
           id="remoteVideo"
           ref={remoteVideoRef}

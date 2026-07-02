@@ -7,6 +7,8 @@ const SOCKET_URL = "http://host.docker.internal:3000";
 const socket = io(SOCKET_URL);
 socket.on("connect", () => {
   console.log(`connected to nestjs signaling server. ID : ${socket.id}`);
+
+  socket.emit("join-room", { roomId });
   startBrowserStream();
 });
 
@@ -18,9 +20,9 @@ async function startBrowserStream() {
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
   const newPage = await browser.newPage();
-  await newPage.setViewport({ width: 800, height: 800 });
+  await newPage.setViewport({ width: 800, height: 600 });
   console.log("navigating to google.com");
-  newPage.goto("https://google.com");
+  await newPage.goto("https://google.com");
 
   const cdpSession = await newPage.target().createCDPSession();
   console.log("starting screencast stream");
@@ -29,18 +31,26 @@ async function startBrowserStream() {
   await cdpSession.send("Page.startScreencast", {
     format: "jpeg",
     quality: 60,
-    maxHeight: 800,
+    maxHeight: 600,
     maxWidth: 800,
   });
 
   // 3. Listen for frames emitted by Chrome
   cdpSession.on("Page.screencastFrame", ({ data, sessionId, metadata }) => {
-    
     // 'data' is the Base64-encoded JPEG image string
     socket.emit("page-frame", { roomId, frame: data });
 
     // We MUST acknowledge the frame, otherwise Chrome stops sending new ones
     cdpSession.send("Page.screencastFrameAck", { sessionId });
+  });
+  socket.on("canvas-click", async (data) => {
+    const { x, y } = data;
+    try {
+      // Puppeteer mouse click helper
+      await newPage.mouse.click(x, y);
+    } catch (err) {
+      console.error("Failed to inject mouse click:", err);
+    }
   });
   socket.on("disconnect", async () => {
     console.log("Signaling disconnected. Shutting down browser...");

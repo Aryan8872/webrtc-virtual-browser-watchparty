@@ -96,4 +96,13 @@ export class SignalingGateway
     const { roomId, frame } = data;
     client.to(roomId).emit('page-frame', { frame });
   }
+
+  @SubscribeMessage('canvas-click')
+  handleCanvasClick(
+    @MessageBody() data: { roomId: string; x: number; y: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { roomId, x, y } = data;
+    client.to(roomId).emit('canvas-click', { x, y });
+  }
 }
