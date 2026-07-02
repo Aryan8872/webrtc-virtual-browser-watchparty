@@ -8,7 +8,11 @@ node_modules/
 # Local env files
 .env
 .env.local
-__Complete Documentation_ Virtual Browser Watch Pa.md
+
+# Documentation & Screenshots
+*.pdf
+**/google.png
+
 # Build output
 dist/
 build/
