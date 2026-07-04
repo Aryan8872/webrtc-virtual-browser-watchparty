@@ -2,6 +2,8 @@ import puppeteer from "puppeteer";
 import path from "path";
 import { io } from "socket.io-client";
 import { spawn } from "child_process";
+import dgram from "dgram"; // Node.js built-in UDP Socket module
+import { RTCPeerConnection, MediaStreamTrack } from "werift"; // Pure-TS WebRTC
 const roomId = "room-100";
 const SOCKET_URL = "http://host.docker.internal:3000";
 const socket = io(SOCKET_URL);
