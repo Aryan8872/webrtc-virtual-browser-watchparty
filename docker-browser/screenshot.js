@@ -1,266 +1,333 @@
 import puppeteer from "puppeteer";
-import path from "path";
 import { io } from "socket.io-client";
 import { spawn } from "child_process";
-import dgram from "dgram"; // Node.js built-in UDP Socket module
-import { RTCPeerConnection, MediaStreamTrack } from "werift"; // Pure-TS WebRTC
-const roomId = "room-100";
-const SOCKET_URL = "http://host.docker.internal:3000";
-const socket = io(SOCKET_URL);
-const DISPLAY = ":99";
+import dgram from "dgram";
+import { RTCPeerConnection, MediaStreamTrack } from "werift";
 
-// STUN servers configuration for the container's WebRTC connection
+// ============================================
+// CONFIG — loaded from .env via Node --env-file
+// ============================================
+const DISPLAY    = process.env.DISPLAY_NUM  || ":99";
+const WIDTH      = parseInt(process.env.BROWSER_WIDTH  || "1280");
+const HEIGHT     = parseInt(process.env.BROWSER_HEIGHT || "720");
+const RTP_PORT   = parseInt(process.env.RTP_PORT       || "5004");
+const AUDIO_PORT = parseInt(process.env.AUDIO_PORT     || "5005");
+const SOCKET_URL = process.env.SOCKET_URL   || "http://host.docker.internal:3000";
+const ROOM_ID    = process.env.ROOM_ID      || "room-100";
+
+console.log(`[Config] ${WIDTH}x${HEIGHT} | Display: ${DISPLAY} | Room: ${ROOM_ID}`);
+console.log(`[Config] Video RTP: ${RTP_PORT} | Audio RTP: ${AUDIO_PORT}`);
+
+// ============================================
+// WEBRTC STUN CONFIG
+// ============================================
 const peerConfiguration = {
   iceServers: [
-    {
-      urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"],
-    },
+    { urls: ["stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"] },
   ],
 };
 
+// ============================================
+// SOCKET
+// ============================================
+const socket = io(SOCKET_URL);
 socket.on("connect", () => {
-  console.log(`connected to nestjs signaling server. ID : ${socket.id}`);
-
-  socket.emit("join-room", { roomId });
-  // startBrowserStream();
-  startXvfbBrowserAndWebRTC();
+  console.log(`[Socket] Connected. ID: ${socket.id}`);
+  startVirtualBrowser();
 });
+socket.on("connect_error", (err) => console.error(`[Socket] Error: ${err.message}`));
 
-async function startXvfbBrowserAndWebRTC() {
-  console.log("1. Starting Xvfb Virtual Display Server on display :99...");
+// ============================================
+// HELPERS
+// ============================================
+function waitMs(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-  // Run command: Xvfb :99 -screen 0 800x600x24 -ac +extension GLX +render -noreset
+// ============================================
+// MAIN BOOT SEQUENCE
+// ============================================
+async function startVirtualBrowser() {
+
+  // ── 1. Xvfb Virtual Display ──────────────────────────────────────────────
+  console.log(`1. Starting Xvfb ${WIDTH}x${HEIGHT} on ${DISPLAY}...`);
   const xvfb = spawn("Xvfb", [
-    DISPLAY,
-    "-screen",
-    "0",
-    "800x600x24", // Screen index 0, resolution 800x600, 24-bit color depth
-    "-ac", // Disable access control (allows anyone to connect to display)
-    "+extension",
-    "GLX",
-    "+render",
-    "-noreset",
+    DISPLAY, "-screen", "0", `${WIDTH}x${HEIGHT}x24`,
+    "-ac", "+extension", "GLX", "+render", "-noreset",
   ]);
-  // Handle virtual display crash or error logs
-  xvfb.stderr.on("data", (data) => {
-    console.log(`[Xvfb Log]: ${data}`);
+  xvfb.stderr.on("data", (d) => process.stdout.write(`[Xvfb] ${d}`));
+  await waitMs(1200);
+
+  // ── 2. PulseAudio Virtual Audio Sink ─────────────────────────────────────
+  // Why: Chromium outputs audio to the system sound server.
+  // We create a virtual PulseAudio "null sink" — a fake speaker.
+  // FFmpeg then captures the monitor (loopback) of that sink.
+  console.log("2. Starting PulseAudio virtual audio sink...");
+
+  // Write a daemon.conf that forces 48000Hz system-wide BEFORE starting PA.
+  // This is the correct way to set sample rate — not via CLI flags.
+  // PulseAudio reads ~/.config/pulse/daemon.conf on startup.
+  const paConfigDir  = "/root/.config/pulse";
+  const paConfigFile = `${paConfigDir}/daemon.conf`;
+  const paConfig = [
+    "default-sample-rate = 48000",
+    "alternate-sample-rate = 48000",
+    "default-sample-channels = 2",
+    "default-sample-format = float32le",
+    "resample-method = speex-float-5", // High-quality resampler as fallback
+    "exit-idle-time = -1",
+  ].join("\n");
+
+  // Ensure config directory exists and write the config
+  const { execSync } = await import("child_process");
+  try {
+    execSync(`mkdir -p ${paConfigDir}`);
+    execSync(`echo '${paConfig}' > ${paConfigFile}`);
+    console.log("2. PulseAudio daemon.conf written (48000Hz forced).");
+  } catch (e) {
+    console.warn("[PA] Could not write daemon.conf:", e.message);
+  }
+
+  const pulseaudio = spawn("pulseaudio", [
+    "--daemonize=no",
+    "--log-target=stderr",
+    "--exit-idle-time=-1",
+  ]);
+  pulseaudio.stderr.on("data", (d) => {
+    const msg = d.toString().trim();
+    if (msg) process.stdout.write(`[PA] ${msg}\n`);
   });
+  await waitMs(1500);
 
-  // Wait 1 second to ensure Xvfb is running in memory before opening the browser
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  console.log("2. Launching Chromium inside Virtual Display...");
+  // Create null sink at 48000Hz stereo — matches Opus native rate exactly.
+  // WHY explicit rate=48000: the default varies per distro (often 44100).
+  // A mismatch forces a resampler in the chain → resampling artifacts.
+  spawn("pactl", ["load-module", "module-null-sink",
+    "sink_name=virtual_sink",
+    "rate=48000",
+    "channels=2",
+    "channel_map=front-left,front-right",
+    "sink_properties=device.description=VirtualSink",
+  ]);
+  await waitMs(600);
 
-  // We set the DISPLAY environment variable so Chromium opens inside our virtual screen
+  // Set as default sink so Chromium routes audio here automatically
+  spawn("pactl", ["set-default-sink", "virtual_sink"]);
+  console.log("2. PulseAudio virtual_sink (48000Hz stereo) created and set as default.");
+
+  // ── 3. Chromium — Full Browser UI with Anti-Detection ────────────────────
   process.env.DISPLAY = DISPLAY;
 
+  // CAPTCHA FIX: These 3 mechanisms together defeat Google's bot detection:
+  //   a) --disable-blink-features=AutomationControlled → removes navigator.webdriver
+  //   b) --user-data-dir → persistent profile (cookies/session survive restarts)
+  //   c) page.evaluateOnNewDocument → belt-and-suspenders JS-level cleanup
+  console.log("3. Launching Chromium (anti-bot flags active)...");
   const browser = await puppeteer.launch({
-    headless: false, // CRUCIAL: Must be headful so it draws a window in Xvfb
+    headless: false,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--window-size=800,600", // Match display size
-      "--start-maximized", // Open maximized in the display
-      "--disable-gpu", // Optional: disables GPU sandbox for virtual environments
+      `--window-size=${WIDTH},${HEIGHT}`,
+      "--window-position=0,0",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--disable-infobars",
+      "--disable-session-crashed-bubble",
+      // KEY anti-detection flag: hides navigator.webdriver from websites
+      "--disable-blink-features=AutomationControlled",
+      // Persistent profile: Google recognises returning users and trusts them more
+      "--user-data-dir=/tmp/chrome-profile",
     ],
   });
 
-  const page = await browser.newPage();
-  await page.setViewport({ width: 800, height: 600 });
-  await page.goto("https://google.com");
+  const pages = await browser.pages();
+  const page  = pages[0];
 
-  // 3. Initialize WebRTC Media Track inside the container
-  console.log("3. Initializing WebRTC video track...");
-  // Create a raw VP8 video track
-  const videoTrack = new MediaStreamTrack({ kind: "video", codec: "VP8" });
-
-  // Create the WebRTC Peer Connection
-  const pc = new RTCPeerConnection(peerConfiguration);
-  pc.addTrack(videoTrack); // Register our video track with the connection
-
-  // Listen for local ICE candidates and emit them to the signaling server
-  pc.onIceCandidate.subscribe((candidate) => {
-    if (candidate) {
-      socket.emit("ice-candidate", { roomId, candidate });
-    }
+  // Remove remaining webdriver traces at the JS engine level (belt-and-suspenders)
+  await page.evaluateOnNewDocument(() => {
+    // Remove the navigator.webdriver property that Puppeteer injects
+    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    // Make Chrome plugins look like a real browser (not zero plugins)
+    Object.defineProperty(navigator, "plugins", {
+      get: () => [1, 2, 3, 4, 5],
+    });
+    // Real Chrome has specific language settings
+    Object.defineProperty(navigator, "languages", {
+      get: () => ["en-US", "en"],
+    });
   });
 
-  // 4. Set up the local UDP server to capture FFmpeg stream packets
-  console.log("4. Binding UDP socket on port 5004 for FFmpeg capture...");
-  const udpServer = dgram.createSocket("udp4");
-
-  udpServer.on("message", (msg) => {
-    // 'msg' is a Buffer containing a single RTP video packet sent by FFmpeg.
-    // We write this raw packet directly into our WebRTC video track!
-    videoTrack.writeRtp(msg);
-  });
-
-  udpServer.bind(5004, "127.0.0.1");
-
-  // 5. Start FFmpeg screen capture (streaming to local UDP port 5004)
-  console.log("5. Spawning FFmpeg...");
-  const ffmpeg = spawn("ffmpeg", [
-    "-f",
-    "x11grab",
-    "-video_size",
-    "800x600",
-    "-framerate",
-    "30",
-    "-i",
-    `${DISPLAY}.0`,
-    "-c:v",
-    "libvpx", // VP8 video encoder
-    "-cpu-used",
-    "5",
-    "-deadline",
-    "realtime",
-    "-b:v",
-    "800k",
-    "-f",
-    "rtp",
-    "rtp://127.0.0.1:5004", // Stream to our UDP server
-  ]);
-
-  // Log FFmpeg statistics
-  ffmpeg.stderr.on("data", (data) => {
-    // FFmpeg naturally prints stats to stderr; we can inspect them for frame rates
-    const message = data.toString();
-    if (message.includes("frame=")) {
-      // Just parse and print frame stats so our terminal isn't overwhelmed
-      console.log(`[FFmpeg Stats]: ${message.trim().split("\n").pop()}`);
-    }
-  });
-  console.log(
-    "Virtual Display, Browser, and FFmpeg screen capture are all running!",
+  // Use a real-looking user agent (not "HeadlessChrome")
+  await page.setUserAgent(
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   );
 
-  // ==========================================
-  // WEBRTC SIGNALING HANDLERS (Inside Container)
-  // ==========================================
+  await page.goto("https://www.google.com", { waitUntil: "domcontentloaded" });
+  console.log("3. Browser is at google.com with anti-detection active.");
 
-  // Receive offer from React client (React client creates the offer first)
+  // ── 4. WebRTC Tracks ─────────────────────────────────────────────────────
+  console.log("4. Initializing WebRTC video (VP8) + audio (Opus) tracks...");
+  const videoTrack = new MediaStreamTrack({ kind: "video", codec: "VP8" });
+  const audioTrack = new MediaStreamTrack({ kind: "audio", codec: "opus" });
+
+  const pc = new RTCPeerConnection(peerConfiguration);
+  pc.addTrack(videoTrack);
+  pc.addTrack(audioTrack);
+
+  pc.onIceCandidate.subscribe((candidate) => {
+    if (candidate) {
+      socket.emit("ice-candidate", { roomId: ROOM_ID, iceCandidate: candidate });
+    }
+  });
+
+  // ── 5. UDP Servers — receive RTP packets from FFmpeg ─────────────────────
+  console.log(`5. Binding UDP servers on ports ${RTP_PORT} (video) and ${AUDIO_PORT} (audio)...`);
+
+  const videoUdp = dgram.createSocket("udp4");
+  videoUdp.on("message", (msg) => videoTrack.writeRtp(msg));
+  videoUdp.bind(RTP_PORT, "127.0.0.1");
+
+  const audioUdp = dgram.createSocket("udp4");
+  audioUdp.on("message", (msg) => audioTrack.writeRtp(msg));
+  audioUdp.bind(AUDIO_PORT, "127.0.0.1");
+
+  // ── 6. FFmpeg Video — x11grab → VP8 → UDP:5004 ──────────────────────────
+  console.log("6. Starting FFmpeg video capture...");
+  const ffmpegVideo = spawn("ffmpeg", [
+    "-f",          "x11grab",
+    "-draw_mouse", "1",                  // Render X11 cursor on the stream
+    "-video_size", `${WIDTH}x${HEIGHT}`,
+    "-framerate",  "30",
+    "-i",          `${DISPLAY}.0`,
+    "-c:v",        "libvpx",
+    "-cpu-used",   "5",
+    "-deadline",   "realtime",
+    "-b:v",        "1500k",
+    "-f",          "rtp",
+    `rtp://127.0.0.1:${RTP_PORT}`,
+  ]);
+  ffmpegVideo.stderr.on("data", (d) => {
+    const msg = d.toString();
+    if (msg.includes("frame=")) {
+      process.stdout.write(`[FFmpeg-V] ${msg.trim().split("\n").pop()}\n`);
+    }
+  });
+
+  // ── 7. FFmpeg Audio — PulseAudio monitor → Opus → UDP:5005 ───────────────
+  //
+  // Audio distortion root causes and their fixes:
+  //
+  // 1. VBR + RTP = bad: Variable bitrate changes Opus packet sizes every frame.
+  //    The browser's jitter buffer expects consistent-sized packets.
+  //    Unpredictable sizes → buffer stalls → crackling/distortion.
+  //    FIX: -vbr off (CBR — constant bitrate, constant packet sizes)
+  //
+  // 2. Resampling: PulseAudio was at 44100Hz, FFmpeg outputs 48000Hz.
+  //    Any resampling in the chain adds phase errors → distortion.
+  //    FIX: PulseAudio sink created at 48000Hz (above) — zero resampling.
+  //
+  // 3. High compression_level causes CPU spikes in a resource-constrained
+  //    container, causing timing jitter in the audio pipeline.
+  //    FIX: removed — libopus default compression is fine.
+  //
+  // 4. -fragment_size 4096: ensures FFmpeg reads from PulseAudio in
+  //    uniform chunk sizes — prevents burst reads that cause timing gaps.
+  console.log("7. Starting FFmpeg audio capture (CBR Opus, 48kHz)...");
+  const ffmpegAudio = spawn("ffmpeg", [
+    "-f",              "pulse",
+    "-fragment_size",  "4096",      // Uniform read chunks from PulseAudio
+    "-i",              "virtual_sink.monitor",
+    "-c:a",            "libopus",
+    "-application",    "audio",     // Music/general mode — NOT voice processing
+    "-b:a",            "128k",      // 128k CBR — enough for stereo audio
+    "-vbr",            "off",       // KEY FIX: CBR — stable packet sizes for RTP
+    "-frame_duration", "20",        // Standard 20ms Opus frames
+    "-ar",             "48000",     // Matches PulseAudio sink rate — no resampling
+    "-ac",             "2",         // Stereo
+    "-f",              "rtp",
+    `rtp://127.0.0.1:${AUDIO_PORT}`,
+  ]);
+  ffmpegAudio.stderr.on("data", (d) => {
+    const msg = d.toString();
+    if (msg.includes("size=") || msg.includes("error") || msg.includes("Error")) {
+      process.stdout.write(`[FFmpeg-A] ${msg.trim().split("\n").pop()}\n`);
+    }
+  });
+
+  console.log("✅ Virtual browser is fully running with video + audio!");
+
+  // ── 8. WebRTC Signaling ───────────────────────────────────────────────────
   socket.on("sdp-offer", async (data) => {
-    console.log("[Container] Received SDP Offer from client");
+    console.log("[SDP] Received Offer — generating Answer...");
     await pc.setRemoteDescription(data.sdp);
-
-    // Create an answer and set local description
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-
-    // Emit answer back to the room
-    socket.emit("sdp-answer", { roomId, sdp: answer });
+    socket.emit("sdp-answer", { roomId: ROOM_ID, sdp: answer });
+    console.log("[SDP] Answer sent.");
   });
+
   socket.on("ice-candidate", async (data) => {
-    if (data.candidate) {
-      await pc.addIceCandidate(data.candidate);
+    if (data.iceCandidate) {
+      await pc.addIceCandidate(data.iceCandidate);
     }
   });
 
-  // ==========================================
-  // MOUSE & KEYBOARD INJECTION HANDLERS
-  // ==========================================
-  socket.on("canvas-click", async (data) => {
-    const { x, y } = data;
-    try {
-      await page.mouse.click(x, y);
-    } catch (err) {
-      console.error("Failed to inject mouse click:", err);
-    }
+  // ── 9. Input Injection — xdotool at X11 level ────────────────────────────
+  socket.on("canvas-click", (data) => {
+    const x = Math.round(data.x);
+    const y = Math.round(data.y);
+    console.log(`[Input] Click x=${x} y=${y}`);
+    spawn("xdotool", ["mousemove", "--sync", String(x), String(y)]);
+    spawn("xdotool", ["click", "1"]);
   });
-  socket.on("canvas-keydown", async (data) => {
-    const { key } = data;
-    try {
-      await page.keyboard.press(key);
-    } catch (err) {
-      console.error(`Failed to inject keypress: ${key}`, err);
+
+  socket.on("canvas-mousemove", (data) => {
+    spawn("xdotool", ["mousemove", String(Math.round(data.x)), String(Math.round(data.y))]);
+  });
+
+  socket.on("canvas-scroll", (data) => {
+    const { deltaX, deltaY } = data;
+    if (deltaY !== 0) {
+      const btn   = deltaY > 0 ? "5" : "4"; // 5=down, 4=up
+      const steps = Math.max(1, Math.round(Math.abs(deltaY) / 120));
+      for (let i = 0; i < steps; i++) spawn("xdotool", ["click", btn]);
+    }
+    if (deltaX !== 0) {
+      const btn   = deltaX > 0 ? "7" : "6"; // 7=right, 6=left
+      const steps = Math.max(1, Math.round(Math.abs(deltaX) / 120));
+      for (let i = 0; i < steps; i++) spawn("xdotool", ["click", btn]);
     }
   });
 
+  socket.on("canvas-keydown", (data) => {
+    const keyMap = {
+      Enter: "Return", Backspace: "BackSpace", Tab: "Tab", Escape: "Escape",
+      Delete: "Delete", Home: "Home", End: "End",
+      PageUp: "Prior", PageDown: "Next",
+      ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
+      " ": "space", F5: "F5", F12: "F12",
+    };
+    const xdoKey = keyMap[data.key] || data.key;
+    console.log(`[Input] Key "${data.key}" → "${xdoKey}"`);
+    spawn("xdotool", ["key", xdoKey]);
+  });
+
+  // ── 10. JOIN ROOM — only after all listeners are registered ──────────────
+  console.log(`10. Joining signaling room "${ROOM_ID}"...`);
+  socket.emit("join-room", { roomId: ROOM_ID });
+
+  // ── 11. Graceful Shutdown ─────────────────────────────────────────────────
   socket.on("disconnect", async () => {
+    console.log("[Socket] Disconnected. Shutting down...");
+    ffmpegVideo.kill("SIGTERM");
+    ffmpegAudio.kill("SIGTERM");
     await browser.close();
-    ffmpeg.kill(); // Terminate FFmpeg first
-    xvfb.kill();
-    console.log("shutting down virtual display and browser");
+    xvfb.kill("SIGTERM");
+    pulseaudio.kill("SIGTERM");
+    videoUdp.close();
+    audioUdp.close();
+    pc.close();
     process.exit(0);
   });
 }
-
-// async function startBrowserStream() {
-//   console.log(`starting chromium browser inside the container...`);
-
-//   const browser = await puppeteer.launch({
-//     headless: "new",
-//     args: ["--no-sandbox", "--disable-setuid-sandbox"],
-//   });
-//   const newPage = await browser.newPage();
-//   await newPage.setViewport({ width: 800, height: 600 });
-//   console.log("navigating to google.com");
-//   await newPage.goto("https://google.com");
-
-//   const cdpSession = await newPage.target().createCDPSession();
-//   console.log("starting screencast stream");
-
-//   // 2. Start the screencast. Chrome will start capturing and emitting frames.
-//   await cdpSession.send("Page.startScreencast", {
-//     format: "jpeg",
-//     quality: 60,
-//     maxHeight: 600,
-//     maxWidth: 800,
-//   });
-
-//   // 3. Listen for frames emitted by Chrome
-//   cdpSession.on("Page.screencastFrame", ({ data, sessionId, metadata }) => {
-//     // 'data' is the Base64-encoded JPEG image string
-//     socket.emit("page-frame", { roomId, frame: data });
-
-//     // We MUST acknowledge the frame, otherwise Chrome stops sending new ones
-//     cdpSession.send("Page.screencastFrameAck", { sessionId });
-//   });
-//   socket.on("canvas-click", async (data) => {
-//     const { x, y } = data;
-//     console.log(`[Container] Received canvas-click event inside container. Payload:`, data);
-//     console.log(`Injecting mouse click inside container at: x=${x}, y=${y}`);
-//     try {
-//       // Puppeteer mouse click helper
-//       await newPage.mouse.click(x, y);
-//     } catch (err) {
-//       console.error("Failed to inject mouse click:", err);
-//     }
-//   });
-//   socket.on("canvas-keydown", async (data) => {
-//     const { key } = data;
-//     console.log(`[Container] Received keydown event inside container. Key: ${key}`);
-//     try {
-//       // Puppeteer keyboard press helper
-//       await newPage.keyboard.press(key);
-//     } catch (err) {
-//       console.error(`Failed to inject keypress: ${key}`, err);
-//     }
-//   });
-//   socket.on("disconnect", async () => {
-//     console.log("Signaling disconnected. Shutting down browser...");
-//     await browser.close();
-//     process.exit(0);
-//   });
-// }
-// async function run() {
-//   console.log("lauching headless chromium browser");
-//   const browser = await puppeteer.launch({
-//     args: ["--no-sandbox", "--disable-setuid-sandbox"],
-//   });
-//   const newPage = await browser.newPage();
-//   console.log("created new page and navigating to google.com");
-//   await newPage.goto("https://google.com");
-
-//   // Simplified output path (saves directly to the current volume folder)
-//   const outputPath = "google.png";
-//   console.log(`Taking screenshot and saving to: ${outputPath}`);
-//   await newPage.screenshot({ path: outputPath });
-
-//   await browser.close();
-//   console.log("Browser closed successfully!");
-// }
-
-// run().catch((err) => {
-//   console.error("Error running screenshot script:", err);
-//   process.exit(1);
-// });

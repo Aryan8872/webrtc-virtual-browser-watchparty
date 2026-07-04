@@ -6,6 +6,8 @@ RUN apt-get update && apt-get install -y \
     chromium \
     xvfb \
     ffmpeg \
+    xdotool \
+    pulseaudio \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
     fonts-thai-tlwg \
@@ -31,5 +33,6 @@ RUN npm install puppeteer
 # 7. Copy the rest of the application files (screenshot.js)
 COPY . .
 
-# 8. Command to run when the container starts  (its run time command)
-CMD ["node", "screenshot.js"]
+# 8. Command to run when the container starts
+# --env-file=.env loads our .env config (mounted from host via volume)
+CMD ["node", "--env-file=.env", "screenshot.js"]

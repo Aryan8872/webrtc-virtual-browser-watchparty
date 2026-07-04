@@ -118,4 +118,22 @@ export class SignalingGateway
     console.log(`[Backend] Relay keydown for room ${roomId}: ${key}`);
     client.to(roomId).emit('canvas-keydown', { key });
   }
+
+  @SubscribeMessage('canvas-mousemove')
+  handleCanvasMousemove(
+    @MessageBody() data: { roomId: string; x: number; y: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { roomId, x, y } = data;
+    client.to(roomId).emit('canvas-mousemove', { x, y });
+  }
+
+  @SubscribeMessage('canvas-scroll')
+  handleCanvasScroll(
+    @MessageBody() data: { roomId: string; deltaX: number; deltaY: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { roomId, deltaX, deltaY } = data;
+    client.to(roomId).emit('canvas-scroll', { deltaX, deltaY });
+  }
 }

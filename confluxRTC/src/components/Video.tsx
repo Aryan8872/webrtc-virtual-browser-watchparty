@@ -19,6 +19,10 @@ import type {
   USER_JOINED_EMIT,
 } from "../types/socket.emit";
 
+// Resolution must match docker-browser/.env — single source of truth
+const BROWSER_WIDTH  = parseInt(import.meta.env.VITE_BROWSER_WIDTH  || "1280");
+const BROWSER_HEIGHT = parseInt(import.meta.env.VITE_BROWSER_HEIGHT || "720");
+
 const Video = () => {
   const mediaConstraints = {
     video: {
@@ -33,6 +37,10 @@ const Video = () => {
 
   const localStreamRef = useRef<MediaStream | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const lastMoveTimeRef   = useRef<number>(0);         // Throttle: mouse moves
+  const lastScrollTimeRef = useRef<number>(0);         // Throttle: scroll events
+  const remoteStreamRef   = useRef<MediaStream | null>(null); // Accumulate video+audio tracks
+  const [isMuted, setIsMuted] = useState(true);        // Audio starts muted (browser policy)
 
   // Public STUN servers to fetch our public IP and Port (helps bypass NAT)
   const peerConfiguration: RTCConfiguration = {
@@ -51,20 +59,38 @@ const Video = () => {
     const peerConnection = new RTCPeerConnection(peerConfiguration);
     peerConnectionRef.current = peerConnection;
 
-    // 1. Listen for remote audio/video tracks sent by the virtual browser container
+    // Create a single shared MediaStream that accumulates BOTH video and audio tracks.
+    // WHY: ontrack fires once per track (video first, then audio). If we create a new
+    // MediaStream on each event, the second track overwrites the first on srcObject.
+    // Solution: reuse one MediaStream and call .addTrack() for each incoming track.
+    remoteStreamRef.current = new MediaStream();
+
     peerConnection.ontrack = (event) => {
-      console.log("[Frontend] Remote WebRTC stream track received:", event.streams[0]);
+      console.log(`[Frontend] Track received: kind=${event.track.kind} id=${event.track.id}`);
+
+      // Add the incoming track into our shared stream
+      remoteStreamRef.current!.addTrack(event.track);
+
+      // Point the video element at the shared stream (safe to do multiple times)
       if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = event.streams[0];
+        remoteVideoRef.current.srcObject = remoteStreamRef.current;
+        remoteVideoRef.current.play().catch((err) =>
+          console.warn("[Frontend] Autoplay blocked:", err)
+        );
       }
     };
 
-    // 2. Listen for local ICE candidates and send them via signaling
     peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
         socket.emit(ICE_CANDIDATE, { roomId, iceCandidate: event.candidate });
       }
     };
+
+    // Tell the browser SDP to include a video AND audio receive section.
+    // Without these the offer has no m=video / m=audio lines → werift crashes.
+    peerConnection.addTransceiver("video", { direction: "recvonly" });
+    peerConnection.addTransceiver("audio", { direction: "recvonly" });
+
     return peerConnection;
   };
 
@@ -141,16 +167,15 @@ const Video = () => {
     // Step E: A user leaves the room. Clean up the connection and UI.
     socket.on("user-left", (data: { userId: string }) => {
       console.log(`User left the room: ${data.userId}`);
-
-      // 1. Close the WebRTC connection instance
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
-        peerConnectionRef.current = null; // Reset the ref to null
+        peerConnectionRef.current = null;
       }
-      // 2. Clear the remote video stream in the UI
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = null;
       }
+      remoteStreamRef.current = null;
+      setIsMuted(true); // Reset mute state when peer disconnects
     });
 
     // WebRTC connection is handled dynamically via sdp-offer and ontrack events.
@@ -168,79 +193,121 @@ const Video = () => {
   }, []);
 
   const handleStartConnection = () => {
-    // Trigger socket connection
     socket.connect();
   };
+
+  // Toggle audio mute state.
+  // WHY this button pattern: Chrome's autoplay policy BLOCKS audio on page load
+  // unless triggered by a real user gesture (a click). We start muted, then let
+  // the user unmute with one deliberate click — this satisfies the browser policy.
+  const handleToggleMute = () => {
+    if (remoteVideoRef.current) {
+      remoteVideoRef.current.muted = !remoteVideoRef.current.muted;
+      setIsMuted(remoteVideoRef.current.muted);
+    }
+  };
+
+  // ── Shared helper: scale display coords → virtual browser coords ──────────
+  const scaleCoords = (event: React.MouseEvent<HTMLVideoElement>) => {
+    const rect = remoteVideoRef.current!.getBoundingClientRect();
+    return {
+      x: ((event.clientX - rect.left)  / rect.width)  * BROWSER_WIDTH,
+      y: ((event.clientY - rect.top)   / rect.height) * BROWSER_HEIGHT,
+    };
+  };
+
   const handleCanvasClick = (event: React.MouseEvent<HTMLVideoElement>) => {
-    const video = remoteVideoRef.current;
-    if (!video) return;
-    const rect = video.getBoundingClientRect();
-
-    // Calculate click coordinates relative to the video element bounds
-    const relativeX = event.clientX - rect.left;
-    const relativeY = event.clientY - rect.top;
-
-    // Scale coordinates to match the virtual browser's 800x600 viewport
-    const targetX = (relativeX / rect.width) * 800;
-    const targetY = (relativeY / rect.height) * 600;
-
-    console.log(`[Frontend] Click. Scaled coordinates: x=${targetX}, y=${targetY}`);
-
-    // Emit coordinates to the backend
-    socket.emit(CANVAS_CLICK, { roomId, x: targetX, y: targetY });
+    if (!remoteVideoRef.current) return;
+    const { x, y } = scaleCoords(event);
+    socket.emit(CANVAS_CLICK, { roomId, x, y });
   };
 
   const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLVideoElement>) => {
+    // Prevent browser shortcuts from intercepting keys (e.g. Backspace navigating back)
     event.preventDefault();
-    const key = event.key;
-    console.log(`[Frontend] Key pressed: ${key}`);
-    socket.emit(CANVAS_KEYDOWN, { roomId, key });
+    socket.emit(CANVAS_KEYDOWN, { roomId, key: event.key });
+  };
+
+  const handleCanvasMouseMove = (event: React.MouseEvent<HTMLVideoElement>) => {
+    const now = Date.now();
+    // Throttle to ~20 events/sec — enough for smooth cursor without flooding socket
+    if (now - lastMoveTimeRef.current < 50) return;
+    lastMoveTimeRef.current = now;
+    if (!remoteVideoRef.current) return;
+    const { x, y } = scaleCoords(event);
+    socket.emit("canvas-mousemove", { roomId, x, y });
+  };
+
+  const handleCanvasWheel = (event: React.WheelEvent<HTMLVideoElement>) => {
+    // Prevent the host page from scrolling while the user scrolls inside the virtual browser
+    event.preventDefault();
+    const now = Date.now();
+    // Throttle to ~30 scroll events/sec
+    if (now - lastScrollTimeRef.current < 33) return;
+    lastScrollTimeRef.current = now;
+    socket.emit("canvas-scroll", { roomId, deltaX: event.deltaX, deltaY: event.deltaY });
   };
 
   return (
     <div>
-      <h1>real time video call with webrtc simulated</h1>
-      <p>{inRoom ? "online" : "offline"}</p>
-      <div className="flex flex-row gap-3">
-        <video id="localVideo" ref={localVideoRef} playsInline autoPlay muted width="200"></video>
-        
-        {/* The Interactive Virtual Browser Video Player */}
+      <h1>Virtual Browser Watch Party</h1>
+      <p>{inRoom ? "🟢 Online" : "🔴 Offline"}</p>
+
+      <div style={{ display: "flex", flexDirection: "row", gap: "12px", alignItems: "flex-start" }}>
+        {/* Local webcam (small thumbnail) */}
+        <video id="localVideo" ref={localVideoRef} playsInline autoPlay muted width="200" />
+
+        {/* ── Virtual Browser Stream ──────────────────────────────────────── */}
         <div>
-          <h3>Virtual Browser Stream (WebRTC)</h3>
+          {/* Toolbar above the browser — audio toggle + status */}
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "6px" }}>
+            <h3 style={{ margin: 0 }}>Virtual Browser — {BROWSER_WIDTH}×{BROWSER_HEIGHT}</h3>
+            <button
+              onClick={handleToggleMute}
+              style={{
+                padding: "6px 14px",
+                borderRadius: "6px",
+                border: "none",
+                cursor: "pointer",
+                fontWeight: "bold",
+                background: isMuted ? "#ef4444" : "#22c55e",
+                color: "white",
+                fontSize: "14px",
+              }}
+            >
+              {isMuted ? "🔇 Unmute Audio" : "🔊 Mute Audio"}
+            </button>
+          </div>
+
           <video
             id="remoteVideo"
             ref={remoteVideoRef}
-            onClick={(e) => handleCanvasClick(e)}
-            onKeyDown={(e) => handleCanvasKeyDown(e)}
-            tabIndex={0} // Makes the video element focusable for typing
+            onClick={handleCanvasClick}
+            onKeyDown={handleCanvasKeyDown}
+            onMouseMove={handleCanvasMouseMove}
+            onWheel={handleCanvasWheel}
+            tabIndex={0}
             playsInline
             autoPlay
-            style={{ 
-              border: "2px solid #334155", 
-              background: "#0f172a", 
-              width: "800px", 
-              height: "600px", 
-              outline: "none", 
-              cursor: "text" 
+            muted={isMuted}  // Controlled by state — user clicks button to unmute
+            style={{
+              display:    "block",
+              width:      `${BROWSER_WIDTH}px`,
+              height:     `${BROWSER_HEIGHT}px`,
+              border:     "2px solid #334155",
+              background: "#0f172a",
+              outline:    "none",
+              cursor:     "none", // Hide host cursor — browser cursor shown via FFmpeg
             }}
-          ></video>
+          />
         </div>
       </div>
 
-      <div className="flex justify-center">
+      <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
         <button onClick={handleStartConnection}>Connect socket</button>
-        <button
-          id="startBtn"
-          className="bg-green-500 text-white p-4 rounded-lg"
-        >
-          Start
-        </button>
-        <button id="callBtn" className="bg-blue-500 text-white p-4 rounded-lg">
-          Call
-        </button>
-        <button id="endBtn" className="bg-red-500 text-white p-4 rounded-lg">
-          End
-        </button>
+        <button id="startBtn" className="bg-green-500 text-white p-4 rounded-lg">Start</button>
+        <button id="callBtn"  className="bg-blue-500  text-white p-4 rounded-lg">Call</button>
+        <button id="endBtn"   className="bg-red-500   text-white p-4 rounded-lg">End</button>
       </div>
     </div>
   );
