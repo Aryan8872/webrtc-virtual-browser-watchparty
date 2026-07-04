@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { socket } from "../lib/api/socket";
 import {
   CANVAS_CLICK,
+  CANVAS_KEYDOWN,
   ICE_CANDIDATE,
   JOIN_ROOM,
   PAGE_FRAME,
@@ -160,20 +161,7 @@ const Video = () => {
       }
     });
 
-    socket.on(PAGE_FRAME, (data: PAGE_FRAME_EMIT) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) return;
-
-      // Create a new image object in memory
-      const img = new Image();
-      // When the image loads, draw it onto our canvas
-      img.onload = () => {
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      };
-      img.src = `data:image/jpeg;base64,${data.frame}`;
-    });
+    // WebRTC connection is handled dynamically via sdp-offer and ontrack events.
 
     return () => {
       socket.off("connect");
@@ -191,11 +179,12 @@ const Video = () => {
     // Trigger socket connection
     socket.connect();
   };
-  const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = canvasRef.current;
-    const rect = canvas.getBoundingClientRect();
+  const handleCanvasClick = (event: React.MouseEvent<HTMLVideoElement>) => {
+    const video = remoteVideoRef.current;
+    if (!video) return;
+    const rect = video.getBoundingClientRect();
 
-    // Calculate click coordinates relative to the canvas element bounds
+    // Calculate click coordinates relative to the video element bounds
     const relativeX = event.clientX - rect.left;
     const relativeY = event.clientY - rect.top;
 
@@ -203,45 +192,47 @@ const Video = () => {
     const targetX = (relativeX / rect.width) * 800;
     const targetY = (relativeY / rect.height) * 600;
 
+    console.log(`[Frontend] Click. Scaled coordinates: x=${targetX}, y=${targetY}`);
+
     // Emit coordinates to the backend
     socket.emit(CANVAS_CLICK, { roomId, x: targetX, y: targetY });
   };
-  const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
-    // Prevent default browser behaviors (like space scrolling page down, backspace navigating back)
+
+  const handleCanvasKeyDown = (event: React.KeyboardEvent<HTMLVideoElement>) => {
     event.preventDefault();
-    
     const key = event.key;
     console.log(`[Frontend] Key pressed: ${key}`);
-    
-    // Emit the key value directly over the socket connection
-    socket.emit("canvas-keydown", { roomId, key });
+    socket.emit(CANVAS_KEYDOWN, { roomId, key });
   };
+
   return (
     <div>
       <h1>real time video call with webrtc simulated</h1>
       <p>{inRoom ? "online" : "offline"}</p>
       <div className="flex flex-row gap-3">
-        <video id="localVideo" ref={localVideoRef} playsInline autoPlay></video>
-        {/* The Virtual Browser Canvas */}
+        <video id="localVideo" ref={localVideoRef} playsInline autoPlay muted width="200"></video>
+        
+        {/* The Interactive Virtual Browser Video Player */}
         <div>
-          <h3>Virtual Browser Stream</h3>
-          <canvas
-            ref={canvasRef}
+          <h3>Virtual Browser Stream (WebRTC)</h3>
+          <video
+            id="remoteVideo"
+            ref={remoteVideoRef}
             onClick={(e) => handleCanvasClick(e)}
             onKeyDown={(e) => handleCanvasKeyDown(e)}
-            tabIndex={0} // Makes the canvas focusable for keyboard events
-            width="800"
-            height="600"
-            style={{ border: "2px solid #334155", background: "#0f172a", outline: "none", cursor: "text" }}
-          ></canvas>
+            tabIndex={0} // Makes the video element focusable for typing
+            playsInline
+            autoPlay
+            style={{ 
+              border: "2px solid #334155", 
+              background: "#0f172a", 
+              width: "800px", 
+              height: "600px", 
+              outline: "none", 
+              cursor: "text" 
+            }}
+          ></video>
         </div>
-
-        <video
-          id="remoteVideo"
-          ref={remoteVideoRef}
-          playsInline
-          autoPlay
-        ></video>
       </div>
 
       <div className="flex justify-center">

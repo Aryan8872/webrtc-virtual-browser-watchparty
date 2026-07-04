@@ -103,7 +103,9 @@ export class SignalingGateway
     @ConnectedSocket() client: Socket,
   ) {
     const { roomId, x, y } = data;
-    console.log(`[Backend] Relay canvas-click for room ${roomId} to x:${x}, y:${y}`);
+    console.log(
+      `[Backend] Relay canvas-click for room ${roomId} to x:${x}, y:${y}`,
+    );
     client.to(roomId).emit('canvas-click', { x, y });
   }
 

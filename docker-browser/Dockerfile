@@ -4,6 +4,8 @@ FROM node:20-slim
 # 2. Install Chromium and dependencies needed to run it on Linux
 RUN apt-get update && apt-get install -y \
     chromium \
+    xvfb \
+    ffmpeg \
     fonts-ipafont-gothic \
     fonts-wqy-zenhei \
     fonts-thai-tlwg \
